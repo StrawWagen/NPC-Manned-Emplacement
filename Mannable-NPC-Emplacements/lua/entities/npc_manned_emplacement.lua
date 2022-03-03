@@ -3,7 +3,7 @@ AddCSLuaFile()
 ENT.Type             = "anim"
 ENT.Base             = "base_anim"
 ENT.PrintName        = "NPC Manned Emplacement"
-ENT.Author            = "Zach88889"
+ENT.Author            = "Zach88889+StrawWagen"
 ENT.Information        = ""
 ENT.Category        = "NPC Emplacements"
 resource.AddFile( "materials/vgui/entities/npc_manned_emplacement.vtf" )
