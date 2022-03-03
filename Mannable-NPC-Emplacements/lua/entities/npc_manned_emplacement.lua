@@ -23,8 +23,8 @@ sound.Add( {
     name = "MountedTurret.Initialize",
     channel = CHAN_WEAPON,
     volume = 1.0,
-    level = SNDLVL_GUNFIRE,
-    pitch = { 75 },
+    level = 75,
+    pitch = { 80 },
     sound = { "weapons/ar2/ar2_reload.wav" }
 } )
 sound.Add( {
@@ -72,7 +72,6 @@ function ENT:AttachToBarricade( Barricade )
     self:SetAngles(Barricade:GetAngles())
     self:SetParent(Barricade)
 end
-
 
 if SERVER then
 
@@ -122,15 +121,18 @@ function ENT:Initialize()
     self.MaxAmmo = 150
     self.TurretClip = self.MaxAmmo
     self.ReloadTime = 3
-    self.FreeGun = false
+    self.FreeGun = true
+    self.EmplaceManned = false
+    self.EmplaceActive = false
     self.LocAng = Angle(0, 0, 0)
     self.LocAngVel = Angle(0, 0, 0)
     
-    self.EmplAimDir = nil
+    self.EmplAimDir = Angle( 0 )
     self.EmplUser = nil
     self.ManningDist = 20
     self.NextFire = 0
     self.NextRandomAim = 0
+    self.NextNpcSearch = 0
     self.NextBigThink = 0
     self.NextSmallThink = 0
     self.MaxAcquireDist = 1000
@@ -143,6 +145,66 @@ function ENT:Initialize()
     self.NextLowAmmoSentence = 0
     self.NextDoneReloadSentence = 0
     
+    local MinBear, MaxBear = self:GetPoseParameterRange( 0 )
+    local MinElev, MaxElev = self:GetPoseParameterRange( 1 )
+    self.MinBearing = MinBear
+    self.MaxBearing = MaxBear
+    self.MinElevation = MinElev
+    self.MaxElevation = MaxElev
+    
+end
+
+local function EmitMountSound( self )
+    if not IsValid( self ) then return end 
+    self:EmitSound("Func_Tank.BeginUse")
+    self:EmitSound("MountedTurret.Initialize")
+end
+
+local function EmplacementIsFree( self )
+    if self.EmplaceActive then return false end
+    return true
+end
+
+function ENT:PlyEnterEmplacement( Ply )
+    if not IsValid( self ) or not IsValid( Ply ) then return end
+    if not EmplacementIsFree( self ) then return end
+    if IsValid( self.EmplUser ) then
+        self:ExitEmplacement( self.EmplUser )
+        self:EmplClear()
+    end
+    net.Start( "TurretBlockAttackToggle" )
+    net.WriteBit( true )
+    net.Send( Ply )
+    Ply.StrawMannedEmplacementCurrent = self
+    Ply:DrawViewModel( false )
+    Ply.EmplEquipWeapon = Ply:GetActiveWeapon()
+    self.FreeGun = false
+    self.EmplUser = Ply
+    self.EmplaceManned = true
+    local seq, dur = self:LookupSequence("retract")
+    self:ResetSequence(seq)
+    timer.Simple(dur,function()
+        self.EmplaceActive = true
+    end)
+    
+    EmitMountSound(self)
+end
+
+function ENT:PlyExitEmplacement( Ply )
+    if IsValid( Ply ) then 
+        net.Start( "TurretBlockAttackToggle" )
+        net.WriteBit( false )
+        net.Send( Ply )
+        Ply:DrawViewModel( true )
+        Ply.StrawMannedEmplacementCurrent = nil
+    end
+    if IsValid( self ) then
+        self.FreeGun = true
+        self.EmplUser = nil
+        self.ExitedEmplacement = true
+        self.EmplaceActive = false
+        self.EmplaceManned = false
+    end
 end
 
 function ENT:EnterEmplacement( NPC )
@@ -155,8 +217,7 @@ function ENT:EnterEmplacement( NPC )
     timer.Simple(dur,function()
         self.EmplaceActive = true
     end)
-    self:EmitSound("Func_Tank.BeginUse")
-    self:EmitSound("MountedTurret.Initialize")
+    EmitMountSound(self)
 end
 
 function ENT:ExitEmplacement( NPC )
@@ -191,13 +252,6 @@ function ENT:EmplClear()
     self.EmplaceManned = false
     self.EmplUser = nil
     self:ResetSequence("idle_inactive")
-    timer.Simple(5,function()
-        if not IsValid(self) or IsValid(self.EmplUser) then return end
-        if ( self:GetLocalAngles().y >= 20 or self:GetLocalAngles().y <= -20 or self:GetLocalAngles().x >= 10 ) then
-            local ResetAngle = Angle(0,0,0)
-            self:SetLocalAngles(ResetAngle)
-        end
-    end)
 end
 
 local function InRange( value, min, max )
@@ -208,7 +262,11 @@ end
 
 function ENT:Use( activator )
     if IsValid( activator ) and not self.IsDead then
-        self:EmitSound( "Buttons.snd40" )
+        if not activator.StrawMannedEmplacementCurrent then
+            self:PlyEnterEmplacement( activator )
+        elseif self == activator.StrawMannedEmplacementCurrent then
+            self:PlyExitEmplacement( activator )
+        end
     end
 end
 
@@ -228,15 +286,26 @@ end
 function ENT:Think()
     self:NextThink( CurTime() + engine.TickInterval() )
     if not self.IsDead then 
-        if self.NextBigThink < CurTime() then
-            self.NextBigThink = CurTime() + 0.5
-            
-            if not self.EmplAimDir then
-                self.EmplAimDir = self:GetAngles()
+        local UserIsNpc = false
+        local UserIsPly = false
+        if not IsValid( self.EmplUser ) then
+            if self.NextNpcSearch < CurTime() then
+                self.NextNpcSearch = CurTime() + math.Rand( 0.9, 1.1 )
+                self:SearchForPersonToManIt()
+                -- print( self.EmplUser )
             end
-            
-            self:SearchForPersonToManIt(turret)
-            
+        end
+        if IsValid( self.EmplUser ) then -- do this isvalid twice cuz a user may have been found
+            UserIsNpc = self.EmplUser:IsNPC()
+            UserIsPlayer = self.EmplUser:IsPlayer()
+        end  
+        
+        if self.UserWasNpc and UserIsPly then
+            self.UserWasNpc = false
+        end
+        
+        if UserIsNpc or self.UserWasNpc then 
+        
             local StandPos = self:GetEmplacementStandPos()
             local DistToEmpl = 0
             local IncapableOfManning = false
@@ -246,232 +315,285 @@ function ENT:Think()
                 DistToEmpl = self.EmplUser:GetPos():Distance( StandPos )
                 IncapableOfManning = self.EmplUser.IncorrectSequenceCount <= 0
             end
-            
-            if ( DeadNpc or DistToEmpl > 1000 or IncapableOfManning ) and self.FreeGun == false then
-                if IncapableOfManning and IsValid( self.EmplUser ) then 
-                    EmplBlacklist( self.EmplUser )
-                end 
-                self:EmplClear()
-            elseif not DeadNpc then
+                        
+            if self.NextBigThink < CurTime() then
+                self.NextBigThink = CurTime() + 0.5
+                
+                if not self.EmplAimDir then
+                    self.EmplAimDir = self:GetAngles()
+                end
+                
+                if ( DeadNpc or DistToEmpl > 1000 or IncapableOfManning ) and self.FreeGun == false then
+                    if IncapableOfManning and IsValid( self.EmplUser ) then 
+                        EmplBlacklist( self.EmplUser )
+                    end 
+                    self:EmplClear()
+                    self.UserWasNpc = false
+                elseif not DeadNpc then
+                    self.UserWasNpc = true
+                    local Enemy = self.EmplUser:GetEnemy()
+                    local ValidEnemy = IsValid( Enemy )
+                    local CanShootEnemy = false
+                    local EnemyPos = Vector(0)
+                    if ValidEnemy then
+                        EnemyPos = HitPos( Enemy )
+                        CanShootEnemy = self:EmplacementCanShoot( Enemy:GetPos() )
+                    end
+                    local CorrectSequence = self.EmplUser:GetSequenceName( self.EmplUser:GetSequence() ) == "Man_Gun"
+                    local GoodEnemy = ValidEnemy and CanShootEnemy
+                    local CanEnterEmplacement = GoodEnemy or not ValidEnemy
+                    local LocalAng = self:GetLocalAngles()
+                    
+                    if CorrectSequence and DistToEmpl < self.ManningDist then
+                        self.EmplUser.IncorrectSequenceCount = math.Clamp( self.EmplUser.IncorrectSequenceCount + 1, 0, 40 )
+                    elseif not CorrectSequence and DistToEmpl < self.ManningDist then
+                        self.EmplUser.IncorrectSequenceCount = math.Clamp( self.EmplUser.IncorrectSequenceCount + -1, 0, 40 )
+                    end
+                    
+                    self:LookForEnemies(self.EmplUser)
+                    
+                    if DistToEmpl <= self.ManningDist and CanEnterEmplacement then
+                        self.EmplUser:SetNPCState( NPC_STATE_SCRIPT )
+                        -- re-mann
+                        if not self.EmplaceManned then
+                            self:EnterEmplacement( self.EmplUser )
+                        end
+                        -- angle reset
+                        if self.EmplUser:GetNPCState() == NPC_STATE_SCRIPT and self.EmplUser:GetLocalAngles().y ~= self:GetAngles().y then
+                            local resetang = self.EmplUser:GetAngles()
+                            resetang.y = self:GetAngles().y
+                            self.EmplUser:SetAngles(resetang)
+                            self.EmplUser:SetSequence( "Man_Gun" )
+                        end
+
+                        self.EmplUser:SetSchedule(SCHED_COMBAT_FACE)
+                        self.EmplUser:ClearCondition(68)
+                        self.EmplUser:SetCondition(67)
+
+                        if self.EmplUser:GetActiveWeapon() ~= NULL then
+                            self.EmplUser:GetActiveWeapon():SetNoDraw(true)
+                        end
+
+                        self.EmplUser:SetSequence( "Man_Gun" )
+                    end
+                    
+                    local InDanger = sound.GetLoudestSoundHint( 8, self.EmplUser:GetPos() )
+                    
+                    --flee the emplacement
+                    if InDanger and self.EmplUser:GetNPCState() == NPC_STATE_SCRIPT and DistToEmpl <= self.ManningDist then
+                        self:ExitEmplacement( self.EmplUser )
+                        self.EmplUser:SetSchedule( SCHED_TAKE_COVER_FROM_BEST_SOUND )
+                        -- print( "Flee" )
+                    end
+                    
+                    -- get out of the emplacement
+                    if not CanShootEnemy and self.EmplUser:GetActiveWeapon() ~= NULL and DistToEmpl <= self.ManningDist and IsValid(self.EmplUser) and IsValid(Enemy) and self.EmplUser:GetNPCState() == NPC_STATE_SCRIPT then
+                        self:ExitEmplacement( self.EmplUser )
+                        -- print( "badang" )
+                    end
+                    
+                    -- return to the emplacement
+                    if not InDanger and DistToEmpl > self.ManningDist and IsValid(self.EmplUser) and CanEnterEmplacement and !self.EmplUser:IsCurrentSchedule(SCHED_FORCED_GO_RUN) and self.EmplUser:GetNPCState() ~= NPC_STATE_SCRIPT then
+                        self.EmplUser:SetLastPosition( StandPos )
+                        self.EmplUser:SetSchedule( SCHED_FORCED_GO_RUN )
+                        -- print( "return" )
+                    end
+                    
+                    -- got too far away from the emplacement
+                    if DistToEmpl > self.ManningDist and IsValid(self.EmplUser) and self.EmplUser:GetNPCState() == NPC_STATE_SCRIPT then
+                        self:ExitEmplacement( self.EmplUser )
+                        --print( "far" )
+                    end
+                    if DistToEmpl > self.ManningDist then
+                        self:ExitEmplacement( self.EmplUser )
+                        --print( "far2" )
+                    end
+                end
+            end
+            if not DeadNpc then
                 local Enemy = self.EmplUser:GetEnemy()
+                local EnemyHealth = 0
                 local ValidEnemy = IsValid( Enemy )
                 local CanShootEnemy = false
                 local EnemyPos = Vector(0)
+                local FullAmmo = self.TurretClip >= self.MaxAmmo
+                
                 if ValidEnemy then
+                    EnemyHealth = Enemy:Health()
                     EnemyPos = HitPos( Enemy )
-                    CanShootEnemy = self:EmplacementCanShoot( Enemy:GetPos() )
+                    CanShootEnemy = self:EmplacementCanShoot( EnemyPos ) and self.EmplUser:Visible( Enemy )
                 end
-                local CorrectSequence = self.EmplUser:GetSequenceName( self.EmplUser:GetSequence() ) == "Man_Gun"
-                local GoodEnemy = ValidEnemy and CanShootEnemy
-                local CanEnterEmplacement = GoodEnemy or not ValidEnemy
-                local LocalAng = self:GetLocalAngles()
-                
-                if CorrectSequence and DistToEmpl < self.ManningDist then
-                    self.EmplUser.IncorrectSequenceCount = math.Clamp( self.EmplUser.IncorrectSequenceCount + 1, 0, 40 )
-                elseif not CorrectSequence and DistToEmpl < self.ManningDist then
-                    self.EmplUser.IncorrectSequenceCount = math.Clamp( self.EmplUser.IncorrectSequenceCount + -1, 0, 40 )
-                end
-                
-                self:LookForEnemies(self.EmplUser)
-                
-                if DistToEmpl <= self.ManningDist and CanEnterEmplacement then
-                    self.EmplUser:SetNPCState( NPC_STATE_SCRIPT )
-                    -- re-mann
-                    if not self.EmplaceManned then
-                        self:EnterEmplacement( self.EmplUser )
-                    end
-                    -- angle reset
-                    if self.EmplUser:GetNPCState() == NPC_STATE_SCRIPT and self.EmplUser:GetLocalAngles().y ~= self:GetAngles().y then
-                        local resetang = self.EmplUser:GetAngles()
-                        resetang.y = self:GetAngles().y
-                        self.EmplUser:SetAngles(resetang)
-                        self.EmplUser:SetSequence( "Man_Gun" )
-                    end
-
-                    self.EmplUser:SetSchedule(SCHED_COMBAT_FACE)
-                    self.EmplUser:ClearCondition(68)
-                    self.EmplUser:SetCondition(67)
-
-                    if self.EmplUser:GetActiveWeapon() ~= NULL then
-                        self.EmplUser:GetActiveWeapon():SetNoDraw(true)
-                    end
-
-                    self.EmplUser:SetSequence( "Man_Gun" )
-
-                    if not self.EmplaceActive or not ValidEnemy or not CanShootEnemy then
-                        self.DoFiring = false
-                    else
-                        self.DoFiring = true
-                    end
-                end
-                
-                local InDanger = sound.GetLoudestSoundHint( 8, self.EmplUser:GetPos() )
-                
-                --flee the emplacement
-                if InDanger and self.EmplUser:GetNPCState() == NPC_STATE_SCRIPT and DistToEmpl <= self.ManningDist then
-                    self:ExitEmplacement( self.EmplUser )
-                    self.EmplUser:SetSchedule( SCHED_TAKE_COVER_FROM_BEST_SOUND )
-                    -- print( "Flee" )
-                end
-                
-                -- get out of the emplacement
-                if not CanShootEnemy and self.EmplUser:GetActiveWeapon() ~= NULL and DistToEmpl <= self.ManningDist and IsValid(self.EmplUser) and IsValid(Enemy) and self.EmplUser:GetNPCState() == NPC_STATE_SCRIPT then
-                    self:ExitEmplacement( self.EmplUser )
-                    -- print( "badang" )
-                end
-                
-                -- return to the emplacement
-                if not InDanger and DistToEmpl > self.ManningDist and IsValid(self.EmplUser) and CanEnterEmplacement and !self.EmplUser:IsCurrentSchedule(SCHED_FORCED_GO_RUN) and self.EmplUser:GetNPCState() ~= NPC_STATE_SCRIPT then
-                    self.EmplUser:SetLastPosition( StandPos )
-                    self.EmplUser:SetSchedule( SCHED_FORCED_GO_RUN )
-                    -- print( "return" )
-                end
-                
-                -- got too far away from the emplacement
-                if DistToEmpl > self.ManningDist and IsValid(self.EmplUser) and self.EmplUser:GetNPCState() == NPC_STATE_SCRIPT then
-                    self:ExitEmplacement( self.EmplUser )
-                    --print( "far" )
-                end
-                if DistToEmpl > self.ManningDist then
-                    self:ExitEmplacement( self.EmplUser )
-                    --print( "far2" )
-                end
-            end
-        end
-        if IsValid( self.EmplUser ) then
-            local Enemy = self.EmplUser:GetEnemy()
-            local EnemyHealth = 0
-            local ValidEnemy = IsValid( Enemy )
-            local CanShootEnemy = false
-            local EnemyPos = Vector(0)
-            
-            if ValidEnemy then
-                EnemyHealth = Enemy:Health()
-                EnemyPos = HitPos( Enemy )
-                CanShootEnemy = self:EmplacementCanShoot( EnemyPos ) and self.EmplUser:Visible( Enemy )
-            end
-            if self.EmplaceActive and self.EmplaceManned and self.NextSmallThink < CurTime() then 
-                self.NextSmallThink = CurTime() + 0.08
-                if CanShootEnemy and self.EmplaceActive then    
-                    self:EmplacementAim( EnemyPos, Enemy )
-                    self.NextRandomAim = CurTime() + math.random( 5, 8 )
-                    self.IdleEmplacement = false
-                    self.AcquireSentence = true
-                    self.ClearFiringLine = true
-                    local tr = util.TraceHull( {
-                        start = self:GetPos(),
-                        endpos = EnemyPos,
-                        filter = { self, self:GetParent(), self.EmplUser },
-                        mins = Vector( -10, -10, -10 ),
-                        maxs = Vector( 10, 10, 10 ),
-                        mask = MASK_SHOT_HULL
-                    } )
-                    if IsValid( tr.Entity ) then
-                        self.ClearFiringLine = not NpcLikes( self.EmplUser, tr.Entity )
-                        if not tr.Entity.NextForcedCover then tr.Entity.NextForcedCover = 0 end
-                        if tr.Entity:IsNPC() and not self.ClearFiringLine and tr.Entity.NextForcedCover < CurTime() then 
-                            tr.Entity:SetSchedule( SCHED_TAKE_COVER_FROM_ENEMY )
-                            tr.Entity.NextForcedCover = CurTime() + 2
-                        end
-                    end
-                    if self.TurretClip < self.MaxAmmo * 0.1 and not self.Reloading then
-                        self.LowAmmo = true
-                    end
-                elseif not ValidEnemy then
-                    if self.NextRandomAim < CurTime() then
+                if self.EmplaceActive and self.EmplaceManned and self.NextSmallThink < CurTime() then 
+                    self.NextSmallThink = CurTime() + 0.08
+                    if CanShootEnemy and self.EmplaceActive and EnabledAi() then    
+                        self:EmplacementAim( EnemyPos, Enemy )
                         self.NextRandomAim = CurTime() + math.random( 5, 8 )
-                        local RandomMul = math.random( -400, 400 )
-                        self.RandomAimPos = self:GetPos() + self:GetForward() * 800 + self:GetRight() * RandomMul
-                    end
-                    if not self.IdleEmplacement then
-                        if self.TurretClip < ( self.MaxAmmo * 0.5 ) then
-                            self.IdleReload = CurTime() + math.random( 2, 3 ) 
-                            -- print( "fastreload" )
-                        else
-                            self.IdleReload = CurTime() + math.random( 8, 12 ) 
+                        self.IdleEmplacement = false
+                        self.AcquireSentence = true
+                        self.ClearFiringLine = true
+                        local tr = util.TraceHull( {
+                            start = self:GetPos(),
+                            endpos = EnemyPos,
+                            filter = { self, self:GetParent(), self.EmplUser },
+                            mins = Vector( -10, -10, -10 ),
+                            maxs = Vector( 10, 10, 10 ),
+                            mask = MASK_SHOT_HULL
+                        } )
+                        if IsValid( tr.Entity ) then
+                            self.ClearFiringLine = not NpcLikes( self.EmplUser, tr.Entity )
+                            if not tr.Entity.NextForcedCover then tr.Entity.NextForcedCover = 0 end
+                            if tr.Entity:IsNPC() and not self.ClearFiringLine and tr.Entity.NextForcedCover < CurTime() then 
+                                tr.Entity:SetSchedule( SCHED_TAKE_COVER_FROM_ENEMY )
+                                tr.Entity.NextForcedCover = CurTime() + 2
+                            end
                         end
+                        if self.TurretClip < self.MaxAmmo * 0.1 and not self.Reloading then
+                            self.LowAmmo = true
+                        end
+                    elseif not ValidEnemy then
+                        if self.NextRandomAim < CurTime() then
+                            self.NextRandomAim = CurTime() + math.random( 5, 8 )
+                            local RandomMul = math.random( -400, 400 )
+                            self.RandomAimPos = self:GetPos() + self:GetForward() * 800 + self:GetRight() * RandomMul
+                        end
+                        if not self.IdleEmplacement and not FullAmmo then
+                            if self.TurretClip < ( self.MaxAmmo * 0.5 ) then
+                                self.IdleReload = CurTime() + math.random( 1, 2 ) 
+                                -- print( "fastreload" )
+                            else
+                                self.IdleReload = CurTime() + math.random( 8, 12 ) 
+                            end
+                        end
+                        
+                        if self.IdleReload then
+                            if self.IdleReload < CurTime() then
+                                -- print( "reload" )
+                                self.ReloadInput = true
+                                self.IdleReload = math.huge
+                            end
+                        end
+                        self:EmplacementAim( self.RandomAimPos, Enemy )
+                        self.IdleEmplacement = true
+                        self.IdleEmplacementSentence = true
+                    end
+                end
+                
+                if self.AimingAtEnemy and EnemyHealth > 0 and CanShootEnemy and self.ClearFiringLine then
+                    self.EmplInputFire = true
+                else
+                    self.EmplInputFire = false            
+                end
+                
+                local IsMetroCop = self.EmplUser:GetClass() == "npc_metropolice"
+                local IsSoldier = self.EmplUser:GetClass() == "npc_combine_s"
+                
+                if self.EnteredEmplacement then
+                    self.EnteredEmplacement = false
+                    if self.NextMannedSentence < CurTime() then
+                        self.NextMannedSentence = CurTime() + math.random( 5, 10 )
+                        self.NextIdleSentence = CurTime() + math.random( 10, 40 )
+                        if IsMetroCop then
+                            self.EmplUser:PlaySentence( "METROPOLICE_FT_MOUNT", 0, 1 )
+                        end
+                    end
+                elseif self.AcquireSentence then
+                    self.AcquireSentence = false
+                    if self.NextAcquireSentence < CurTime() then
+                        self.NextAcquireSentence = CurTime() + math.random( 10, 40 )
+                        self.EmplUser:FoundEnemySound()
+                    end
+                elseif self.IdleEmplacementSentence then
+                    self.IdleEmplacementSentence = false
+                    if self.NextIdleSentence < CurTime() then
+                        self.NextIdleSentence = CurTime() + math.random( 15, 30 )
+                        if IsMetroCop then
+                            self.EmplUser:PlaySentence( "METROPOLICE_FT_SCAN", 0, 1 )
+                        else
+                            self.EmplUser:IdleSound()
+                        end
+                    end
+                elseif self.ExitedEmplacement then
+                    self.ExitedEmplacement = false
+                    if self.NextDismountSentence < CurTime() then
+                        self.NextDismountSentence = CurTime() + math.random( 10, 30 )
+                        if IsMetroCop then
+                            self.EmplUser:PlaySentence( "METROPOLICE_FT_DISMOUNT", 0, 1 )
+                        else
+                            self.EmplUser:AlertSound()
+                        end
+                    end
+                elseif self.LowAmmo then
+                    self.LowAmmo = false
+                    if self.NextLowAmmoSentence < CurTime() then
+                        self.NextLowAmmoSentence = CurTime() + math.random( 10, 40 )
+                        if IsMetroCop then
+                            self.EmplUser:PlaySentence( "METROPOLICE_COVER_NO_AMMO", 0, 1 )
+                        end
+                    end
+                elseif self.DoneReload and not self.Reloading then
+                    self.DoneReload = false
+                    if self.NextDoneReloadSentence < CurTime() then
+                        self.NextDoneReloadSentence = CurTime() + math.random( 10, 40 )
+                        if IsSoldier then
+                            self.EmplUser:PlaySentence( "COMBINE_ANNOUNCE", 0, 1 )
+                        else
+                            self.EmplUser:AlertSound()
+                        end
+                    end
+                end
+            end
+        elseif UserIsPlayer or self.UserWasPlayer then
+            local StandPos = self:GetEmplacementStandPos()
+            local DistToEmpl = 0
+            local DeadPly = not IsValid( self.EmplUser )
+            local ExitEmplace = false
+            if not DeadPly then
+                DeadPly = self.EmplUser:Health() <= 0
+                DistToEmpl = self.EmplUser:GetPos():Distance( StandPos )
+                
+                local ChangedWeap = self.EmplUser.EmplEquipWeapon ~= self.EmplUser:GetActiveWeapon()
+                local TooFar = DistToEmpl > self.ManningDist * 3
+                
+                ExitEmplace = TooFar or ChangedWeap
+            end
+            
+            if not DeadPly and not ExitEmplace then
+                if self.NextSmallThink < CurTime() then 
+                    self.NextSmallThink = CurTime() + 0.08
+                    local Trace = self.EmplUser:GetEyeTraceNoCursor()
+                    debugoverlay.Cross( Trace.HitPos, 5, 1, Color( 255, 255, 255 ), true )
+                    self:EmplacementAim( Trace.HitPos, nil )
+                    
+                    if self.EmplUser:KeyDown( IN_ATTACK ) or self.EmplUser:KeyDown( IN_BULLRUSH ) then
+                        self.EmplInputFire = true
+                    elseif self.EmplInputFire then
+                        self.EmplInputFire = false
                     end
                     
-                    if self.IdleReload then
-                        if self.IdleReload < CurTime() then
-                            -- print( "reload" )
-                            self.ForceReload = true
-                            self.IdleReload = math.huge
-                        end
-                    end
-                    self:EmplacementAim( self.RandomAimPos, Enemy )
-                    self.IdleEmplacement = true
-                    self.IdleEmplacementSentence = true
-                end
-            end
-            
-            if self.DoFiring and self.AimingAtEnemy and EnemyHealth > 0 and CanShootEnemy and self.ClearFiringLine then
-                if self.NextFire < CurTime() then
-                    self.NextFire = CurTime() + 0.06
-                    self:EmplFireThink( true )
-                end
-            else
-                self:EmplFireThink( false )
-            end
-            
-            local IsMetroCop = self.EmplUser:GetClass() == "npc_metropolice"
-            local IsSoldier = self.EmplUser:GetClass() == "npc_combine_s"
-            
-            if self.EnteredEmplacement then
-                self.EnteredEmplacement = false
-                if self.NextMannedSentence < CurTime() then
-                    self.NextMannedSentence = CurTime() + math.random( 5, 10 )
-                    self.NextIdleSentence = CurTime() + math.random( 10, 40 )
-                    if IsMetroCop then
-                        self.EmplUser:PlaySentence( "METROPOLICE_FT_MOUNT", 0, 1 )
+                    if self.EmplUser:KeyDown( IN_RELOAD ) then
+                        self.ReloadInput = true
+                    elseif self.ReloadInput then
+                        self.ReloadInput = false
                     end
                 end
-            elseif self.AcquireSentence then
-                self.AcquireSentence = false
-                if self.NextAcquireSentence < CurTime() then
-                    self.NextAcquireSentence = CurTime() + math.random( 10, 40 )
-                    self.EmplUser:FoundEnemySound()
-                end
-            elseif self.IdleEmplacementSentence then
-                self.IdleEmplacementSentence = false
-                if self.NextIdleSentence < CurTime() then
-                    self.NextIdleSentence = CurTime() + math.random( 15, 30 )
-                    if IsMetroCop then
-                        self.EmplUser:PlaySentence( "METROPOLICE_FT_SCAN", 0, 1 )
-                    else
-                        self.EmplUser:IdleSound()
-                    end
-                end
-            elseif self.ExitedEmplacement then
-                self.ExitedEmplacement = false
-                if self.NextDismountSentence < CurTime() then
-                    self.NextDismountSentence = CurTime() + math.random( 10, 30 )
-                    if IsMetroCop then
-                        self.EmplUser:PlaySentence( "METROPOLICE_FT_DISMOUNT", 0, 1 )
-                    else
-                        self.EmplUser:AlertSound()
-                    end
-                end
-            elseif self.LowAmmo then
-                self.LowAmmo = false
-                if self.NextLowAmmoSentence < CurTime() then
-                    self.NextLowAmmoSentence = CurTime() + math.random( 10, 40 )
-                    if IsMetroCop then
-                        self.EmplUser:PlaySentence( "METROPOLICE_COVER_NO_AMMO", 0, 1 )
-                    end
-                end
-            elseif self.DoneReload and not self.Reloading then
-                self.DoneReload = false
-                if self.NextDoneReloadSentence < CurTime() then
-                    self.NextDoneReloadSentence = CurTime() + math.random( 10, 40 )
-                    if IsSoldier then
-                        self.EmplUser:PlaySentence( "COMBINE_ANNOUNCE", 0, 1 )
-                    else
-                        self.EmplUser:AlertSound()
-                    end
-                end
+            elseif ExitEmplace or DeadPly then
+                self:PlyExitEmplacement( self.EmplUser )
             end
         end
+        if self.EmplInputFire then
+            if self.NextFire < CurTime() then
+                self.NextFire = CurTime() + 0.06
+                self:EmplFireThink( true )
+            end
+        end
+        if self.ReloadInput then
+            self.ReloadInput = false
+            self.ForceReload = true
+            self:EmplFireThink( false )
+        else
+            self.ForceReload = false
+        end
+        
     elseif not self.Inactive then
         if not self.DieSetup then
             self.DieSetup = true
@@ -480,7 +602,14 @@ function ENT:Think()
             self:Ignite( 5, 0 )
             sound.EmitHint( 8, self:GetPos(), 400, 5, NULL )
             if IsValid( self.EmplUser ) then
-                self.EmplUser:FearSound()
+                local UserIsNpc = self.EmplUser:IsNPC()
+                local UserIsPlayer = self.EmplUser:IsPlayer()
+                if UserIsNpc then
+                    self:ExitEmplacement( self.EmplUser )
+                    self.EmplUser:FearSound()
+                elseif UserIsPlayer then
+                    self:PlyExitEmplacement( self.EmplUser )
+                end
             end
         else
             if self.ExplodeSoundTime < CurTime() then 
@@ -575,7 +704,6 @@ end
 
 function ENT:EmplacementAim( AimTargetPos, AimTargetEnt )
     if AimTargetPos == nil then return end
-    if not EnabledAi() then return end
     local DoMarch = true
     if IsValid( AimTargetEnt ) and not self:Visible( AimTargetEnt ) then 
         DoMarch = false
@@ -584,22 +712,33 @@ function ENT:EmplacementAim( AimTargetPos, AimTargetEnt )
     local MuzzleTach = self:LookupAttachment( "muzzle" )
     local Attachment = self:GetAttachment( MuzzleTach )
     
-    local TargetAng = ( AimTargetPos - self:GetPos() ):Angle()
+    local TargetAng = ( AimTargetPos - Attachment.Pos ):Angle()
+    local TargetAngLocal = self:WorldToLocalAngles( TargetAng )
     
     debugoverlay.Axis( self:GetPos(), self.EmplAimDir, 10, 2, true )
     
+    local LocalStart = self:WorldToLocalAngles( self.EmplAimDir )
+    local LocalMarched = LocalStart
+    
     if DoMarch then
-        local Start = self.EmplAimDir
-        self.EmplAimDir = Angle( math.ApproachAngle( Start.p, TargetAng.p, 8 ), math.ApproachAngle( Start.y, TargetAng.y, 8 ), 0 )
+        local Start = LocalStart
+        local NewPitch = math.ApproachAngle( Start.p, TargetAngLocal.p, 8 )
+        local NewYaw = math.ApproachAngle( Start.y, TargetAngLocal.y, 8 )
+        
+        local NewPitch = math.Clamp( NewPitch, self.MinElevation, self.MaxElevation )
+        local NewYaw = math.Clamp( NewYaw, self.MinBearing, self.MaxBearing )
+        
+        LocalMarched = Angle( NewPitch, NewYaw, 0 )
+        self.EmplAimDir = self:LocalToWorldAngles( LocalMarched )
     end
     
     self.AimingAtEnemy = false
-    if math.AngleDifference( self.EmplAimDir.p, TargetAng.p ) < 10 and math.AngleDifference( self.EmplAimDir.y, TargetAng.y ) < 10 then
+    if math.AngleDifference( LocalMarched.p, TargetAngLocal.p ) < 10 and math.AngleDifference( LocalMarched.y, TargetAngLocal.y ) < 10 then
         self.AimingAtEnemy = true
     end
     
-    local LocalMarched = self:WorldToLocalAngles( self.EmplAimDir )
-    local PitchAdj = LocalMarched.p + 10
+    
+    local PitchAdj = LocalMarched.p + 12
     
     self:SetPoseParameter( "aim_yaw", math.Clamp( LocalMarched.y, -59.9, 59.9 ) )
     self:SetPoseParameter( "aim_pitch", math.Clamp( PitchAdj, -34.9, 49.9 ) )
@@ -659,8 +798,8 @@ function ENT:FireMountedTurret()
     bullet.Src = Attachment.Pos
     bullet.Dir = self.EmplAimDir:Forward()
     bullet.Tracer= 1
-    bullet.Spread = Vector(0.040,0.040,0)
-    bullet.Damage = math.random(5,6)
+    bullet.Spread = Vector(0.035,0.035,0)
+    bullet.Damage = math.random(8,10)
     bullet.Force = 2
     bullet.Attacker = self.EmplUser
     bullet.TracerName = "AR2Tracer"
@@ -731,11 +870,12 @@ local function IsValidManner( ent )
     return true
 end
 
-function ENT:SearchForPersonToManIt(turret)
+function ENT:SearchForPersonToManIt()
     local turret = self
     local disabled = turret:LookupSequence("idle_inactive")
     local StandPos = self:GetEmplacementStandPos()
     if not EnabledAi() then return end
+    
     if IsValid( self.NpcToManTheTurret ) and not IsValid( self.EmplUser ) then
         
         local DistToEmpl = self.NpcToManTheTurret:GetPos():Distance( StandPos )
@@ -743,6 +883,7 @@ function ENT:SearchForPersonToManIt(turret)
         local IsRunnin = self.NpcToManTheTurret:IsCurrentSchedule(SCHED_FORCED_GO_RUN)
         local IsClose = DistToEmpl < self.ManningDist
         local CanMan = ThisCanManTurret( self.NpcToManTheTurret, turret )
+        local FailedTask = self.NpcToManTheTurret:IsCurrentSchedule(SCHED_FAIL)
         
         if not IsAlive and IsClose then
             EmplBlacklist( self.NpcToManTheTurret )
@@ -753,7 +894,7 @@ function ENT:SearchForPersonToManIt(turret)
             self.NpcToManTheTurret:SetLastPosition( StandPos )
             self.NpcToManTheTurret:SetSchedule(SCHED_FORCED_GO_RUN)
             debugoverlay.Line( StandPos, self.NpcToManTheTurret:GetPos(), 1, Color( 255, 255, 255 ), true )
-        elseif ( not IsRunnin and not IsClose and not CanMan ) or not IsAlive then
+        elseif ( not IsRunnin and not IsClose and not CanMan ) or not IsAlive or FailedTask then
             self.NpcToManTheTurret = nil
         end
         
@@ -787,8 +928,17 @@ function ENT:SearchForPersonToManIt(turret)
     end
 end
 
-
 function ENT:OnRemove()
-
+    local UserIsNpc = false
+    local UserIsPlayer = false
+    if IsValid( self.EmplUser ) then
+        UserIsNpc = self.EmplUser:IsNPC()
+        UserIsPlayer = self.EmplUser:IsPlayer()
+    end  
+    if UserIsNpc then
+        self:ExitEmplacement( self.EmplUser )
+    elseif UserIsPlayer then
+        self:PlyExitEmplacement( self.EmplUser )
+    end
 end
 end
