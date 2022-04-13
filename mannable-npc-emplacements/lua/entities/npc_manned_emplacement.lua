@@ -928,8 +928,8 @@ function ENT:SearchForPersonToManIt()
             end
         end
         table.sort( NearbyNpcs, function( a, b ) -- sort areas by distance to nextbot
-            local ADist = a:GetPos():Distance( StandPos )
-            local BDist = b:GetPos():Distance( StandPos )
+            local ADist = a:GetPos():DistToSqr( StandPos )
+            local BDist = b:GetPos():DistToSqr( StandPos )
             return ADist < BDist 
         end )
         for _, NpcToManTheTurret in pairs( NearbyNpcs ) do
